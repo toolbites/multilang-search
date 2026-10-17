@@ -1,0 +1,112 @@
+name: Web Search Job
+
+# Website (linkfinder.toolbites.com) is workflow ko chalati hai.
+# Keyword aur languages ENCRYPTED aate hain (payload), is liye public repo mein
+# kisi ko searches nazar nahi aati: run name, logs aur artifacts sab chhupe.
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:       { required: true }
+      payload:      { required: true, description: "encrypted" }
+      callback_url: { required: true }
+
+run-name: "job ${{ inputs.job_id }}"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.c.outputs.chunks }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -q -r requirements.txt
+      - id: c
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          LF_PAYLOAD: ${{ inputs.payload }}
+        run: echo "chunks=$(python search_tool.py chunks -j 5)" >> "$GITHUB_OUTPUT"
+
+  search:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        langs: ${{ fromJson(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -q -r requirements.txt
+      - name: Search
+        continue-on-error: true
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          LF_PAYLOAD: ${{ inputs.payload }}
+          LANGS: ${{ matrix.langs }}
+        run: python search_tool.py search -l $LANGS -w 5 --encrypt -o part.json
+      - id: n
+        env: { LANGS: "${{ matrix.langs }}" }
+        run: echo "name=part-$(echo "$LANGS" | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ steps.n.outputs.name }}
+          path: part.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  merge:
+    needs: search
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -q -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with: { pattern: "part-*", path: parts }
+        continue-on-error: true
+
+      # Tranco traffic list: roz ek baar download, baqi waqt cache se
+      - id: day
+        run: echo "d=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: tranco.csv
+          key: tranco-${{ steps.day.outputs.d }}
+          restore-keys: tranco-
+
+      - name: Merge, dedupe, traffic
+        continue-on-error: true
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          SIMILARWEB_API_KEY: ${{ secrets.SIMILARWEB_API_KEY }}
+        run: |
+          mkdir -p parts
+          python search_tool.py merge -i parts -o result.json
+
+      - name: Send result to website
+        if: always()
+        env:
+          SECRET: ${{ secrets.CALLBACK_SECRET }}
+          URL: ${{ inputs.callback_url }}
+          JOB: ${{ inputs.job_id }}
+        run: |
+          if [ ! -s result.json ]; then
+            echo '{"status":"failed","error":"Search failed. Please try again.","results":[]}' > result.json
+          fi
+          gzip -kf result.json
+          curl -sS -f --retry 3 --retry-delay 5 -o /dev/null -X POST "$URL" \
+            -H "X-Callback-Secret: $SECRET" \
+            -H "X-Job-Id: $JOB" \
+            -H "Content-Type: application/json" \
+            -H "Content-Encoding: gzip" \
+            --data-binary @result.json.gz
+          rm -f result.json result.json.gz
