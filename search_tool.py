@@ -40,18 +40,66 @@ def log(*a):
     print(*a, flush=True)
 
 
+class TranslateError(Exception):
+    pass
+
+
+def _gtx(text, code):
+    """Google Translate (gtx) – tez, JSON."""
+    r = requests.get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": "en", "tl": code, "dt": "t", "q": text}, timeout=15,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    if r.status_code == 429:
+        raise TranslateError("429")
+    r.raise_for_status()
+    out = "".join(part[0] for part in r.json()[0] if part and part[0])
+    return out.strip()
+
+
+def _deep(text, code):
+    return (GoogleTranslator(source="en", target=code).translate(text) or "").strip()
+
+
+def _mymemory(text, code):
+    tl = {"iw": "he", "jw": "jv", "zh-CN": "zh-CN", "zh-TW": "zh-TW", "mni-Mtei": "mni"}.get(code, code)
+    r = requests.get("https://api.mymemory.translated.net/get",
+                     params={"q": text, "langpair": f"en|{tl}"}, timeout=15)
+    r.raise_for_status()
+    d = r.json()
+    if int(d.get("responseStatus", 200)) != 200:
+        raise TranslateError(str(d.get("responseDetails", ""))[:80])
+    return (d.get("responseData", {}).get("translatedText") or "").strip()
+
+
 def translate(text, code):
+    """Translation ya None (fail). Kabhi chup chaap English wapas nahi deta."""
     if code == "en":
         return text
-    for attempt in range(3):
-        try:
-            out = GoogleTranslator(source="en", target=code).translate(text)
-            if out:
-                return out.strip()
-        except Exception as e:
-            log(f"  ! translate {code} try {attempt + 1}: {e}")
-            time.sleep(1 + attempt * 2)
-    return text
+    last = "empty response"
+    for attempt in range(4):
+        for fn in (_gtx, _deep, _mymemory):
+            try:
+                out = fn(text, code)
+                if out and "MYMEMORY WARNING" not in out.upper():
+                    return out
+            except Exception as e:
+                last = f"{fn.__name__}: {e}"
+        time.sleep(2 + attempt * 3 + random.random() * 2)
+    log(f"  ! translate fail {code}: {last[:120]}")
+    return None
+
+
+def translate_all(keyword, codes):
+    """Plan step mein ek baar, aaram se. {code: translation}"""
+    out = {}
+    for i, c in enumerate(codes):
+        t = translate(keyword, LANGUAGES[c]["translate"])
+        if t:
+            out[c] = t
+            mask(t)
+        time.sleep(0.15 + random.random() * 0.2)
+    log(f"Translated {len(out)}/{len(codes)} languages")
+    return out
 
 
 def norm_url(u):
@@ -71,18 +119,55 @@ def domain_of(u):
 
 
 # ---------------- engines ----------------
+# Wikipedia/Grokipedia nahi: sirf asli search engines, is order mein try
+FREE_ENGINES = ["duckduckgo", "brave", "bing", "yahoo", "mojeek", "google", "yandex", "startpage"]
+SKIP_DOMAINS = ("wikipedia.org", "grokipedia.com")
+MIN_GOOD = 5  # itne results mile to engine theek maana jaye
+
+
+def _free_page(ddg, query, region, page, engine):
+    res = ddg.text(query, region=region, safesearch="moderate", max_results=PER_PAGE, page=page, backend=engine) or []
+    out = []
+    for r in res:
+        u = r.get("href") or r.get("url") or ""
+        if not u.startswith("http") or any(d in u for d in SKIP_DOMAINS):
+            continue
+        out.append({"title": r.get("title", ""), "url": u, "snippet": r.get("body", "")})
+    return out
+
+
 def search_free(query, lang, pages):
+    """Har page alag se. Pehla engine jo achhe results de, baqi pages bhi usi se (rank sahi rahe)."""
     from ddgs import DDGS
-    want = pages * PER_PAGE
-    for attempt in range(3):
-        try:
-            res = DDGS().text(query, region=lang["region"], safesearch="moderate", max_results=want) or []
-            return [{"position": i + 1, "page": i // PER_PAGE + 1, "title": r.get("title", ""),
-                     "url": r.get("href", ""), "snippet": r.get("body", "")} for i, r in enumerate(res)]
-        except Exception as e:
-            log(f"  ! search try {attempt + 1}: {e}")
-            time.sleep(3 + attempt * 5 + random.random() * 3)
-    return []
+    ddg = DDGS(timeout=12)
+    region = lang["region"]
+    out, chosen, stats = [], None, []
+    for page in range(1, pages + 1):
+        engines = [chosen] if chosen else FREE_ENGINES
+        best, best_eng = [], None
+        for eng in engines:
+            try:
+                got = _free_page(ddg, query, region, page, eng)
+            except Exception:
+                stats.append(f"{eng}:err")
+                time.sleep(0.4 + random.random() * 0.6)
+                continue
+            if len(got) > len(best):
+                best, best_eng = got, eng
+            if len(got) >= (MIN_GOOD if not chosen else 1):
+                break
+            stats.append(f"{eng}:{len(got)}")
+            time.sleep(0.4 + random.random() * 0.6)
+        if not best:
+            break  # aage ke pages bhi nahi milenge
+        chosen = chosen or best_eng
+        for i, r in enumerate(best[:PER_PAGE]):
+            # Rank poori list mein (page 2 ka pehla = 11), Google ki tarah
+            out.append({"position": (page - 1) * PER_PAGE + i + 1, "page": page, "engine": best_eng, **r})
+        time.sleep(0.5 + random.random())
+    tried = ",".join(stats[:6])
+    log(f"  engine={chosen or 'none'} results={len(out)}" + (f" (tried {tried})" if tried else ""))
+    return out
 
 
 def search_serper(query, lang, pages, key):
@@ -106,9 +191,12 @@ def search_serper(query, lang, pages, key):
     return out
 
 
-def one_language(keyword, code, pages, engine, key):
+def one_language(keyword, code, pages, engine, key, tmap=None):
     lang = LANGUAGES[code]
-    q = translate(keyword, lang["translate"])
+    q = (tmap or {}).get(code) if tmap is not None else translate(keyword, lang["translate"])
+    if not q:
+        log(f"[{lang['name']}] skipped (no translation)")
+        return code, []
     mask(q)
     res = search_serper(q, lang, pages, key) if engine == "serper" else search_free(q, lang, pages)
     rows = []
@@ -122,7 +210,7 @@ def one_language(keyword, code, pages, engine, key):
     return code, rows
 
 
-def do_search(keyword, codes, pages, engine, workers):
+def do_search(keyword, codes, pages, engine, workers, tmap=None):
     key = os.environ.get("SERPER_API_KEY", "")
     if engine == "serper" and not key:
         sys.exit("SERPER_API_KEY set nahi hai.")
@@ -130,7 +218,7 @@ def do_search(keyword, codes, pages, engine, workers):
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = []
         for i, c in enumerate(codes):
-            futs.append(ex.submit(one_language, keyword, c, pages, engine, key))
+            futs.append(ex.submit(one_language, keyword, c, pages, engine, key, tmap))
             if engine == "free":
                 time.sleep(0.8)  # rate limit se bachne ke liye halka gap
         for f in as_completed(futs):
@@ -253,12 +341,16 @@ def main():
     p_s = sub.add_parser("search"); common(p_s)
     p_s.add_argument("-o", "--out", required=True)
     p_s.add_argument("--encrypt", action="store_true", help="part file encrypt karein (public repo)")
+    p_s.add_argument("--translations", help="translate command ki (encrypted) file")
 
     p_m = sub.add_parser("merge")
     p_m.add_argument("-i", "--input", required=True, help="parts folder")
     p_m.add_argument("-o", "--out", required=True)
     p_m.add_argument("--xlsx"); p_m.add_argument("--csv")
     p_m.add_argument("--no-traffic", action="store_true")
+
+    p_t = sub.add_parser("translate")
+    p_t.add_argument("-o", "--out", required=True)
 
     p_c = sub.add_parser("chunks")
     p_c.add_argument("-l", "--languages", nargs="*", default=None)
@@ -275,8 +367,14 @@ def main():
         if a.cmd in ("search", "run"):
             a.keyword = a.keyword or payload["keyword"]
             a.pages = int(payload.get("pages", a.pages))
-        if a.cmd == "chunks" and a.languages is None:
+        if a.cmd in ("chunks", "translate") and getattr(a, "languages", None) is None:
             a.languages = str(payload.get("languages", "all")).split()
+    if a.cmd == "translate":
+        codes, _ = resolve(str(payload.get("languages", "all")).split() if payload else ["all"])
+        tm = translate_all(payload["keyword"], codes)
+        json.dump({"enc": encrypt(tm)}, open(a.out, "w"))
+        return
+
     if a.cmd == "chunks" and not a.languages:
         a.languages = ["all"]
     if a.cmd in ("search", "run") and not a.keyword:
@@ -312,7 +410,13 @@ def main():
     if bad:
         sys.exit(f"Ghalat language codes: {bad}")
     pages = max(1, min(10, a.pages))
-    rows = do_search(a.keyword, codes, pages, a.engine, a.workers)
+    tmap = None
+    if getattr(a, "translations", None) and os.path.exists(a.translations):
+        d = json.load(open(a.translations))
+        tmap = decrypt(d["enc"]) if "enc" in d else d
+        for v in tmap.values():
+            mask(v)
+    rows = do_search(a.keyword, codes, pages, a.engine, a.workers, tmap)
 
     if a.cmd == "search":
         part = {"results": rows}
