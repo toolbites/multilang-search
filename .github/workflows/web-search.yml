@@ -26,7 +26,9 @@ jobs:
         env:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
           LF_PAYLOAD: ${{ inputs.payload }}
-        run: echo "chunks=$(python search_tool.py chunks -j 5)" >> "$GITHUB_OUTPUT"
+        run: |
+          python search_tool.py chunks -j 5 > chunks.txt
+          echo "chunks=$(tail -n 1 chunks.txt)" >> "$GITHUB_OUTPUT"
 
   search:
     needs: plan
@@ -103,10 +105,18 @@ jobs:
             echo '{"status":"failed","error":"Search failed. Please try again.","results":[]}' > result.json
           fi
           gzip -kf result.json
-          curl -sS -f --retry 3 --retry-delay 5 -o /dev/null -X POST "$URL" \
-            -H "X-Callback-Secret: $SECRET" \
-            -H "X-Job-Id: $JOB" \
-            -H "Content-Type: application/json" \
-            -H "Content-Encoding: gzip" \
-            --data-binary @result.json.gz
-          rm -f result.json result.json.gz
+          # Website ko result bhejna (status code aur jawab log mein dikhega)
+          for i in 1 2 3; do
+            code=$(curl -sS -o resp.txt -w "%{http_code}" -X POST "$URL" \
+              -H "X-Callback-Secret: $SECRET" \
+              -H "X-Job-Id: $JOB" \
+              -H "Content-Type: application/octet-stream" \
+              -A "LinkFinder-GitHub/1.0" \
+              --data-binary @result.json.gz) || code=000
+            echo "Website replied: HTTP $code"
+            head -c 300 resp.txt 2>/dev/null; echo
+            if [ "$code" = "200" ]; then break; fi
+            sleep 5
+          done
+          rm -f result.json result.json.gz resp.txt
+          [ "$code" = "200" ]
