@@ -29,11 +29,19 @@ jobs:
         run: |
           python search_tool.py chunks -j 5 > chunks.txt
           echo "chunks=$(tail -n 1 chunks.txt)" >> "$GITHUB_OUTPUT"
+      # Translation ek hi baar, yahan (encrypted file search servers ko jati hai)
+      - name: Translate
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          LF_PAYLOAD: ${{ inputs.payload }}
+        run: python search_tool.py translate -o translations.json
+      - uses: actions/upload-artifact@v4
+        with: { name: translations, path: translations.json, retention-days: 1 }
 
   search:
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +51,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11", cache: pip }
       - run: pip install -q -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with: { name: translations }
       - name: Search
         continue-on-error: true
         env:
@@ -50,7 +60,7 @@ jobs:
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           LF_PAYLOAD: ${{ inputs.payload }}
           LANGS: ${{ matrix.langs }}
-        run: python search_tool.py search -l $LANGS -w 5 --encrypt -o part.json
+        run: python search_tool.py search -l $LANGS -w 5 --encrypt --translations translations.json -o part.json
       - id: n
         env: { LANGS: "${{ matrix.langs }}" }
         run: echo "name=part-$(echo "$LANGS" | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
